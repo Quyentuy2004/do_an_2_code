@@ -89,52 +89,68 @@ String name;
 void checkButton();  
 
 // them nhan uart
-bool uart2ReadLineNonBlocking(String &outLine) {
-  static String buf;            // buffer nội bộ
-  int n = 0;
-
-  while (Serial2.available() && n < MAX_UART_BYTES_PER_LOOP) {
-    char c = (char)Serial2.read();
-    n++;
-
-    if (c == '\n') {
-      outLine = buf;
-      buf = "";
-      outLine.trim();           // bỏ \r + spaces
-      return outLine.length() > 0;
-    } else {
-      if (buf.length() < 200) buf += c;
-      else buf = "";            // overflow -> reset
-    }
-  }
-  return false;
-}
 
 // --- Parse 1 dòng: "Vol= 8.02V Cur= 0.76A" ---
+// Parse 1 dòng bất kỳ, ví dụ:
+// "Vol= 8.02V Cur= 0.76A"
+// "Volt=8.02 Cur=0.76"
+// "V=8.02 I=0.76"
+// Có/không có đơn vị V/A đều được
 bool parseVolCur(const String& s, float &vol, float &cur) {
-  int pVol = s.indexOf("Vol=");
-  int pCur = s.indexOf("Cur=");
+  String x = s;
+  x.trim();
+  x.replace("\r", "");
+  x.replace("\t", " ");
+
+  // chuẩn hoá key để dễ bắt
+  // (không phân biệt hoa thường)
+  String t = x;
+  t.toLowerCase();
+
+  // tìm vị trí key
+  int pVol = t.indexOf("vol=");
+  if (pVol < 0) pVol = t.indexOf("volt=");
+  if (pVol < 0) pVol = t.indexOf("v=");
+
+  int pCur = t.indexOf("cur=");
+  if (pCur < 0) pCur = t.indexOf("current=");
+  if (pCur < 0) pCur = t.indexOf("i=");
+
   if (pVol < 0 || pCur < 0) return false;
 
-  int pV = s.indexOf('V', pVol);
-  int pA = s.indexOf('A', pCur);
-  if (pV < 0 || pA < 0) return false;
+  // Lấy substring từ sau '=' đến trước khoảng trắng/đơn vị
+  auto extractNumber = [&](int pKey) -> String {
+    int pEq = t.indexOf('=', pKey);
+    if (pEq < 0) return "";
+    int start = pEq + 1;
 
-  String volStr = s.substring(pVol + 4, pV);   // sau "Vol=" đến 'V'
-  String curStr = s.substring(pCur + 4, pA);   // sau "Cur=" đến 'A'
-  volStr.trim();
-  curStr.trim();
+    // bỏ khoảng trắng đầu
+    while (start < (int)x.length() && (x[start] == ' ')) start++;
 
-  // kiểm tra cơ bản
+    // kết thúc khi gặp space hoặc chữ cái
+    int end = start;
+    while (end < (int)x.length()) {
+      char c = x[end];
+      if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+') end++;
+      else break;
+    }
+    return x.substring(start, end);
+  };
+
+  String volStr = extractNumber(pVol);
+  String curStr = extractNumber(pCur);
+
   if (volStr.length() == 0 || curStr.length() == 0) return false;
 
   vol = volStr.toFloat();
   cur = curStr.toFloat();
 
-  // nếu toFloat fail thì ra 0; nên check thêm (tùy bạn)
-  // ở đây chấp nhận 0 nhưng bạn có thể điều kiện vol>0...
+  // Nếu bạn muốn loại bỏ line lỗi hoàn toàn:
+  // if (isnan(vol) || isnan(cur)) return false;
+
   return true;
 }
+
 
 bool sendVolCurToFirebase(float vol, float cur) {
   String base = "/"+uid+"/"+name+"/Sensor";
@@ -150,26 +166,30 @@ bool sendVolCurToFirebase(float vol, float cur) {
 }
 
 void truyenVolCur() {
-  // 1) đọc UART2 non-blocking (mỗi lần loop chỉ đọc ít byte)
-  String line;
-  if (uart2ReadLineNonBlocking(line)) {
-    float v, c;
-    if (parseVolCur(line, v, c)) {
-      Vol = v;          // cập nhật biến global của bạn
-      Curent = c;
-      g_lastVol = v;
-      g_lastCur = c;
-      g_vcNew = true;
-      // Serial.printf("Parsed: Vol=%.2f Cur=%.2f\n", v, c);
-    }
-  }
+ while (Serial2.available()) {
+    char c = (char)Serial2.read();
+    if (c == '\n') {
+      String line = lineBuf;
+      lineBuf = "";
+      line.trim(); // bỏ \r và khoảng trắng
+Serial.printf("%s\n", line);
+      if (line.length() == 0) return;
 
-  // 2) gửi Firebase theo chu kỳ, chỉ khi có dữ liệu mới
-  unsigned long nowMs = millis();
-  if (g_vcNew && Firebase.ready() && signupOk && (nowMs - g_prevVolCurFb >= FB_VC_PERIOD_MS)) {
-    g_prevVolCurFb = nowMs;
-    g_vcNew = false;
-    sendVolCurToFirebase(g_lastVol, g_lastCur);
+      float vol = 0, cur = 0;
+      if (parseVolCur(line, vol, cur)) {
+        Serial.printf("Parsed: Vol=%.2fV Cur=%.2fA\n", vol, cur);
+
+        // gửi Firebase (có thể throttle nếu gửi quá nhanh)
+        sendVolCurToFirebase(vol, cur);
+      } else {
+        Serial.print("Bad format: ");
+        Serial.println(line);
+      }
+    } else {
+      // tránh buffer quá dài nếu dữ liệu lỗi
+      if (lineBuf.length() < 200) lineBuf += c;
+      else lineBuf = "";
+    }
   }
 }
 
@@ -503,11 +523,11 @@ void warDatabase(float hum,float temp){
  }
 }
 void capNhatOnl(){
-if (Firebase.RTDB.setTimestamp(&fbdo, "/User/"+uid+"/"+name)) {
-    Serial.println("Đã cập nhật timestamp!");
-  } else {
-    Serial.println(fbdo.errorReason());
-  }
+// if (Firebase.RTDB.setTimestamp(&fbdo, "/User/"+uid+"/"+name)) {
+//     Serial.println("Đã cập nhật timestamp!");
+//   } else {
+//     Serial.println(fbdo.errorReason());
+//   }
 }
 void truyenChinh(float hum,float temp){
   if (Firebase.ready()&& signupOk &&((millis()-sendDataPrevMillis)>5000|| sendDataPrevMillis==0)){
